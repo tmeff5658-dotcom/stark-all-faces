@@ -1,0 +1,821 @@
+https://github.com/tmeff5658-dotcom/stark-all-faces/tree/main/*
+  oled_faces_v3.ino - STARK robot faces, 22 faces (SSD1306 128x64, I2C, ESP32)
+
+  Wiring : SDA = GPIO21, SCL = GPIO22, VCC = 3.3V, GND, address 0x3C
+  Libs   : Adafruit GFX Library + Adafruit SSD1306
+
+  DEMO   : shows the boot splash, then every face for 5 s with a dissolve between faces.
+           Serial Monitor (115200): send 'n' = next face, 'p' = previous face.
+
+  FACES (same order as the enum)
+    IDLE         neutral, does a small action every 10-20 s: looks around, winks or yawns
+    HAPPY, SAD, THINKING, ANGRY
+    LISTENING    wide eyes + sound bars (mic is recording)
+    LOADING_BAR  eyes scan + scanner bar     (waiting for the AI server)
+    LOADING_REACTOR  spinning arc reactor    (same meaning, Stark style)
+    SPEAKING     mouth moves like speech
+    DIZZY        spiral eyes (during the "spin" command)
+    SLEEPING     closed eyes and floating z; wakeUp() opens the eyes slowly
+    CONFUSED     "?" above one eye (the sentence was not understood)
+    SURPRISED    wide eyes with small pupils and an "o" mouth
+    TURN_LEFT / TURN_RIGHT   eyes look to that side + moving arrows (turn signal)
+    STUCK        X eyes + "I am stuck"
+    NO_WIFI      crossed WiFi icon (the robot works with its stored phrases)
+    LOW_BATTERY  tired eyes + blinking battery icon
+    RADAR        the 3 distance readings of the sensor servo (30, 90, 150 degrees)
+    TRANSCRIPT   what the robot heard and what it will say
+    HEART        beating heart eyes (for "good robot")
+    WINK         wink with a smile
+
+  HOW THE ROBOT LOGIC USES THIS FILE LATER (AUTO_CYCLE = false)
+    setFace(FACE_LISTENING, millis());      // mic recording
+    setFace(FACE_LOADING_BAR, millis());    // audio sent, waiting for the PC
+    setFace(FACE_SPEAKING, millis());       // reply audio playing
+    setMicLevel(0.0 .. 1.0);                // real mic loudness  -> LISTENING bars
+    setSpeakLevel(0.0 .. 1.0);              // real speaker loudness -> SPEAKING mouth
+    setBattery(percent);                    // -> LOW_BATTERY icon
+    setRadar(cmAt30, cmAt90, cmAt150);      // -> RADAR   (0 or less = no echo)
+    setTranscript("turn left", "Turning left");
+    wakeUp(millis());                       // from SLEEPING: PIR motion or the robot's name
+
+  WHEN IS THE ROBOT "STUCK"?  (decided by the movement code, not here)
+    - the 3 scan readings (30, 90, 150 degrees) are ALL closer than STUCK_CM (about 20 cm), or
+    - 3 avoidance turns in a row within 10 s and the front is still blocked.
+    Then: setFace(FACE_STUCK, ...), say "I am stuck", stop the motors, wait for a voice command.
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ===================== 1) SCREEN =====================
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+const uint8_t OLED_ADDR = 0x3C;
+const int PIN_SDA = 21;
+const int PIN_SCL = 22;
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ===================== 2) SETTINGS =====================
+const char*         ROBOT_NAME  = "STARK";   // up to 6 letters fit on the splash screen
+const bool          SHOW_SPLASH = true;
+const unsigned long SPLASH_MS   = 2200;
+const bool          AUTO_CYCLE  = true;      // true = demo (change face every FACE_MS)
+const unsigned long FACE_MS     = 5000;
+const unsigned long FRAME_MS    = 40;        // 25 frames per second
+const unsigned long DISSOLVE_MS = 320;       // smooth transition between faces (0 = off)
+
+// ===================== 3) EYE GEOMETRY =====================
+const int EYE_W    = 28;
+const int EYE_H    = 30;
+const int EYE_R    = 8;
+const int EYE_CY   = 24;
+const int EYE_CX_L = 38;
+const int EYE_CX_R = 90;
+
+// ===================== faces =====================
+enum Face {
+  FACE_IDLE = 0,
+  FACE_HAPPY,
+  FACE_SAD,
+  FACE_THINKING,
+  FACE_ANGRY,
+  FACE_LISTENING,
+  FACE_LOADING_BAR,
+  FACE_LOADING_REACTOR,
+  FACE_SPEAKING,
+  FACE_DIZZY,
+  FACE_SLEEPING,
+  FACE_CONFUSED,
+  FACE_SURPRISED,
+  FACE_TURN_LEFT,
+  FACE_TURN_RIGHT,
+  FACE_STUCK,
+  FACE_NO_WIFI,
+  FACE_LOW_BATTERY,
+  FACE_RADAR,
+  FACE_TRANSCRIPT,
+  FACE_HEART,
+  FACE_WINK,
+  FACE_COUNT
+};
+const char* FACE_NAMES[FACE_COUNT] = {
+  "IDLE", "HAPPY", "SAD", "THINKING", "ANGRY", "LISTENING", "LOADING_BAR", "LOADING_REACTOR",
+  "SPEAKING", "DIZZY", "SLEEPING", "CONFUSED", "SURPRISED", "TURN_LEFT", "TURN_RIGHT", "STUCK",
+  "NO_WIFI", "LOW_BATTERY", "RADAR", "TRANSCRIPT", "HEART", "WINK"
+};
+
+// ===================== data given by the robot logic =====================
+float micLevel   = -1.0f;                   // 0..1, negative = demo animation
+float speakLevel = -1.0f;
+int   batteryPct = 12;
+int   radarCm[3] = { 60, 120, 35 };         // at 30, 90 and 150 degrees
+char  transcriptYou[48] = "turn left";
+char  transcriptMe[48]  = "Turning left";
+
+void setMicLevel(float v)   { micLevel = v; }
+void setSpeakLevel(float v) { speakLevel = v; }
+void setBattery(int pct)    { batteryPct = constrain(pct, 0, 100); }
+void setRadar(int cm30, int cm90, int cm150) { radarCm[0] = cm30; radarCm[1] = cm90; radarCm[2] = cm150; }
+void setTranscript(const char* you, const char* me) {
+  strncpy(transcriptYou, you, sizeof(transcriptYou) - 1);
+  transcriptYou[sizeof(transcriptYou) - 1] = 0;
+  strncpy(transcriptMe, me, sizeof(transcriptMe) - 1);
+  transcriptMe[sizeof(transcriptMe) - 1] = 0;
+}
+
+// ===================== state =====================
+Face currentFace = FACE_IDLE;
+Face prevFace = FACE_COUNT;                 // FACE_COUNT = none
+bool started = false;
+unsigned long faceStart = 0, prevStart = 0, transStart = 0, lastFrame = 0;
+
+float gazeX = 0, gazeY = 0, gazeTX = 0, gazeTY = 0;
+unsigned long nextGazeAt = 0;
+
+bool blinking = false;
+unsigned long blinkStart = 0, nextBlinkAt = 1500;
+
+int idleAction = 0;                         // 0 none, 1 look around, 2 wink, 3 yawn
+unsigned long idleActStart = 0, nextIdleAt = 0;
+
+bool waking = false;
+unsigned long wakeStartAt = 0;
+
+uint8_t bufOld[SCREEN_WIDTH * SCREEN_HEIGHT / 8];
+uint8_t bufNew[SCREEN_WIDTH * SCREEN_HEIGHT / 8];
+
+// ===================== animation helpers =====================
+void updateGaze(unsigned long now, float biasX, float biasY, float rangeX, float rangeY) {
+  if (now >= nextGazeAt) {
+    gazeTX = biasX + (random(-100, 101) / 100.0f) * rangeX;
+    gazeTY = biasY + (random(-100, 101) / 100.0f) * rangeY;
+    nextGazeAt = now + random(700, 2200);
+  }
+  gazeX += (gazeTX - gazeX) * 0.25f;
+  gazeY += (gazeTY - gazeY) * 0.25f;
+}
+
+// 1.0 = open, 0.0 = closed. A blink lasts 160 ms, every 1.8 to 4.5 s.
+float blinkOpenness(unsigned long now) {
+  const unsigned long BLINK_MS = 160;
+  if (!blinking && now >= nextBlinkAt) {
+    blinking = true;
+    blinkStart = now;
+  }
+  if (blinking) {
+    unsigned long e = now - blinkStart;
+    if (e >= BLINK_MS) {
+      blinking = false;
+      nextBlinkAt = now + random(1800, 4500);
+      return 1.0f;
+    }
+    float p = (float)e / BLINK_MS;
+    return fabsf(2.0f * p - 1.0f);
+  }
+  return 1.0f;
+}
+
+void endIdleAction(unsigned long now) {
+  idleAction = 0;
+  nextIdleAt = now + (AUTO_CYCLE ? random(1500, 2500) : random(10000, 20000));
+}
+
+// ===================== drawing helpers =====================
+void drawEyeShape(int cx, int cy, int w, int h) {
+  if (h < 2) h = 2;
+  int r = min(EYE_R, h / 2);
+  display.fillRoundRect(cx - w / 2, cy - h / 2, w, h, r, SSD1306_WHITE);
+}
+
+void cutTopCorner(int cx, int cy, int w, int h, bool cutRight, int cut) {
+  int left = cx - w / 2, right = cx + w / 2, top = cy - h / 2;
+  if (cutRight) {
+    display.fillTriangle(left - 1, top - 1, right + 1, top - 1, right + 1, top + cut, SSD1306_BLACK);
+  } else {
+    display.fillTriangle(right + 1, top - 1, left - 1, top - 1, left - 1, top + cut, SSD1306_BLACK);
+  }
+}
+
+// Parabola: middle is |depth| px lower (depth > 0) or higher (depth < 0) than the ends.
+void drawCurve(int cx, int cy, int halfW, int depth, int radius) {
+  for (int dx = -halfW; dx <= halfW; dx++) {
+    float k = (float)dx / halfW;
+    display.fillCircle(cx + dx, cy + (int)lroundf(depth * (1.0f - k * k)), radius, SSD1306_WHITE);
+  }
+}
+
+void drawThickLine(int x0, int y0, int x1, int y1, int r, uint16_t color) {
+  int steps = max(abs(x1 - x0), abs(y1 - y0));
+  if (steps == 0) steps = 1;
+  for (int i = 0; i <= steps; i++) {
+    display.fillCircle(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps, r, color);
+  }
+}
+
+// Arc with math angles (0 = right, 90 = up), in degrees.
+void drawArc(int cx, int cy, int r, int a0, int a1) {
+  for (int a = a0; a <= a1; a += 2) {
+    float rad = a * PI / 180.0f;
+    display.drawPixel(cx + (int)lroundf(r * cosf(rad)), cy - (int)lroundf(r * sinf(rad)), SSD1306_WHITE);
+  }
+}
+
+void drawHeart(int cx, int cy, int r) {
+  r = max(1, r);
+  display.fillCircle(cx - r, cy - r / 2, r, SSD1306_WHITE);
+  display.fillCircle(cx + r, cy - r / 2, r, SSD1306_WHITE);
+  display.fillTriangle(cx - 2 * r, cy - r / 2 + 1, cx + 2 * r, cy - r / 2 + 1, cx, cy + 2 * r, SSD1306_WHITE);
+}
+
+void drawSparkle(int x, int y, int r) {
+  display.drawFastHLine(x - r, y, 2 * r + 1, SSD1306_WHITE);
+  display.drawFastVLine(x, y - r, 2 * r + 1, SSD1306_WHITE);
+  display.drawPixel(x - r / 2, y - r / 2, SSD1306_WHITE);
+  display.drawPixel(x + r / 2, y - r / 2, SSD1306_WHITE);
+  display.drawPixel(x - r / 2, y + r / 2, SSD1306_WHITE);
+  display.drawPixel(x + r / 2, y + r / 2, SSD1306_WHITE);
+}
+
+void drawChevron(int x, int y, int dir) {
+  for (int t = 0; t < 2; t++) {
+    int xx = x + t;
+    display.drawLine(xx - 4 * dir, y - 5, xx, y, SSD1306_WHITE);
+    display.drawLine(xx, y, xx - 4 * dir, y + 5, SSD1306_WHITE);
+  }
+}
+
+void drawSpiral(int cx, int cy, int maxR, float phase, int dir) {
+  const float TURNS = 4.0f * PI;
+  for (float a = 0; a < TURNS; a += 0.22f) {
+    float r = maxR * a / TURNS;
+    int x = cx + (int)lroundf(r * cosf(dir * a + phase));
+    int y = cy + (int)lroundf(r * sinf(dir * a + phase));
+    display.fillRect(x, y, 2, 2, SSD1306_WHITE);
+  }
+}
+
+void drawBatteryIcon(int x, int y, int pct, bool fillOn) {
+  display.drawRect(x, y, 18, 10, SSD1306_WHITE);
+  display.fillRect(x + 18, y + 3, 2, 4, SSD1306_WHITE);
+  if (fillOn) {
+    int w = max(1, 14 * pct / 100);
+    display.fillRect(x + 2, y + 2, w, 6, SSD1306_WHITE);
+  }
+}
+
+void drawTextCentered(const char* s, int y, int size) {
+  int w = (int)strlen(s) * 6 * size;
+  display.setTextSize(size);
+  display.setCursor(max(0, (SCREEN_WIDTH - w) / 2), y);
+  display.print(s);
+}
+
+// Scanner bar (like KITT). frac = 0.0 (left) .. 1.0 (right)
+const int BAR_CELLS = 9;
+void drawScannerBar(float frac) {
+  const int cellW = 10, gap = 2, cellH = 8, y = 48;
+  int totalW = BAR_CELLS * cellW + (BAR_CELLS - 1) * gap;
+  int x0 = (SCREEN_WIDTH - totalW) / 2;
+  float pos = frac * (BAR_CELLS - 1);
+  for (int i = 0; i < BAR_CELLS; i++) {
+    float d = fabsf(i - pos);
+    int x = x0 + i * (cellW + gap);
+    if (d < 0.7f)      display.fillRect(x, y, cellW, cellH, SSD1306_WHITE);
+    else if (d < 1.7f) display.drawRect(x, y, cellW, cellH, SSD1306_WHITE);
+    else if (d < 2.7f) display.drawFastHLine(x, y + cellH / 2, cellW, SSD1306_WHITE);
+    else               display.drawPixel(x + cellW / 2, y + cellH / 2, SSD1306_WHITE);
+  }
+}
+
+void drawReactor(int cx, int cy, unsigned long elapsed) {
+  display.drawCircle(cx, cy, 15, SSD1306_WHITE);
+  display.drawCircle(cx, cy, 14, SSD1306_WHITE);
+  display.drawCircle(cx, cy, 5, SSD1306_WHITE);
+  float spin = elapsed / 260.0f;
+  for (int k = 0; k < 6; k++) {
+    float a = spin + k * (PI / 3.0f);
+    display.drawLine(cx + (int)lroundf(7.0f * cosf(a)), cy + (int)lroundf(7.0f * sinf(a)),
+                     cx + (int)lroundf(12.0f * cosf(a)), cy + (int)lroundf(12.0f * sinf(a)), SSD1306_WHITE);
+  }
+  display.fillCircle(cx, cy, 2 + (int)lroundf(1.0f + sinf(elapsed / 150.0f)), SSD1306_WHITE);
+}
+
+// ===================== one frame of a face =====================
+void renderFace(Face face, unsigned long now, unsigned long elapsed) {
+  float open = blinkOpenness(now);
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  switch (face) {
+
+    // Neutral face. Every 10-20 s (1.5-2.5 s in the demo) it does one small action.
+    case FACE_IDLE: {
+      if (idleAction == 0 && now >= nextIdleAt) {
+        idleAction = (int)random(1, 4);
+        idleActStart = now;
+      }
+      unsigned long ae = now - idleActStart;
+      float rightOpen = 1.0f, squint = 0.0f;
+
+      if (idleAction == 1) {                              // look around
+        gazeTX = (ae < 700) ? -9.0f : (ae < 1400 ? 9.0f : 0.0f);
+        gazeTY = 0;
+        nextGazeAt = now + 200;
+        if (ae > 1800) endIdleAction(now);
+      } else if (idleAction == 2) {                       // wink (right eye)
+        if (ae < 150)      rightOpen = 1.0f - ae / 150.0f;
+        else if (ae < 450) rightOpen = 0.0f;
+        else               rightOpen = min(1.0f, (ae - 450) / 150.0f);
+        if (ae > 650) endIdleAction(now);
+      } else if (idleAction == 3) {                       // yawn
+        squint = sinf(PI * ae / 1600.0f);
+        if (squint < 0) squint = 0;
+        if (ae > 1600) endIdleAction(now);
+      }
+
+      updateGaze(now, 0, 0, 3, 1);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      int hL = max(2, (int)lroundf(EYE_H * open * (1.0f - 0.8f * squint)));
+      int hR = max(2, (int)lroundf(EYE_H * open * rightOpen * (1.0f - 0.8f * squint)));
+      drawEyeShape(EYE_CX_L + gx, EYE_CY + gy, EYE_W, hL);
+      drawEyeShape(EYE_CX_R + gx, EYE_CY + gy, EYE_W, hR);
+      if (squint > 0.05f) {
+        int mh = 4 + (int)lroundf(14.0f * squint);
+        display.fillRoundRect(56, 44, 16, mh, min(6, mh / 2), SSD1306_WHITE);
+      } else {
+        display.drawFastHLine(58, 54, 12, SSD1306_WHITE);
+      }
+      break;
+    }
+
+    case FACE_HAPPY: {
+      updateGaze(now, 0, 0, 5, 2);
+      int bounce = (int)lroundf(2.0f * sinf(elapsed / 260.0f));
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY) + bounce;
+      int depth = (int)lroundf(10.0f * open);
+      drawCurve(EYE_CX_L + gx, EYE_CY + 6 + gy, 13, -depth, 2);
+      drawCurve(EYE_CX_R + gx, EYE_CY + 6 + gy, 13, -depth, 2);
+      drawCurve(64 + gx / 2, 49 + bounce, 16, 7, 1);
+      break;
+    }
+
+    case FACE_SAD: {
+      updateGaze(now, 0, 2, 3, 1);
+      int sink = (int)lroundf(1.0f + sinf(elapsed / 700.0f));
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY) + sink;
+      int h = max(2, (int)lroundf(EYE_H * open));
+      int cy = EYE_CY + 2 + gy;
+      drawEyeShape(EYE_CX_L + gx, cy, EYE_W, h);
+      drawEyeShape(EYE_CX_R + gx, cy, EYE_W, h);
+      cutTopCorner(EYE_CX_L + gx, cy, EYE_W, h, false, 12);
+      cutTopCorner(EYE_CX_R + gx, cy, EYE_W, h, true, 12);
+      drawCurve(64 + gx / 2, 58 + sink, 12, -5, 1);
+      float tp = (elapsed % 1800) / 1800.0f;
+      if (tp < 0.85f) {
+        int tx = EYE_CX_L + gx - 8;
+        int ty = cy + h / 2 + 3 + (int)(tp * 18);
+        display.fillCircle(tx, ty, 2, SSD1306_WHITE);
+        display.fillTriangle(tx, ty - 6, tx - 2, ty - 1, tx + 2, ty - 1, SSD1306_WHITE);
+      }
+      break;
+    }
+
+    case FACE_THINKING: {
+      updateGaze(now, 6, -3, 2, 1.5f);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      int hL = max(2, (int)lroundf(EYE_H * open));
+      int hR = max(2, (int)lroundf(EYE_H * 0.7f * open));
+      drawEyeShape(EYE_CX_L + gx, EYE_CY + gy, EYE_W, hL);
+      drawEyeShape(EYE_CX_R + gx, EYE_CY - 3 + gy, EYE_W, hR);
+      display.drawLine(54, 54, 74, 50, SSD1306_WHITE);
+      display.drawLine(54, 55, 74, 51, SSD1306_WHITE);
+      int n = (int)((elapsed / 450) % 4);
+      if (n >= 1) display.fillCircle(116, 34, 1, SSD1306_WHITE);
+      if (n >= 2) display.fillCircle(120, 26, 2, SSD1306_WHITE);
+      if (n >= 3) display.fillCircle(123, 15, 3, SSD1306_WHITE);
+      break;
+    }
+
+    case FACE_ANGRY: {
+      updateGaze(now, 0, 0, 2, 1);
+      int shake = 0;
+      if ((elapsed % 2000) < 500) shake = ((elapsed / 45) % 2) ? 1 : -1;
+      int gx = (int)lroundf(gazeX) + shake, gy = (int)lroundf(gazeY);
+      int h = max(2, (int)lroundf((EYE_H - 4) * open));
+      int cy = EYE_CY + 2 + gy;
+      drawEyeShape(EYE_CX_L + gx, cy, EYE_W, h);
+      drawEyeShape(EYE_CX_R + gx, cy, EYE_W, h);
+      cutTopCorner(EYE_CX_L + gx, cy, EYE_W, h, true, 13);
+      cutTopCorner(EYE_CX_R + gx, cy, EYE_W, h, false, 13);
+      drawCurve(64 + gx, 58, 14, -3, 1);
+      break;
+    }
+
+    case FACE_LISTENING: {
+      updateGaze(now, 0, 0, 2, 1);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      float pulse = 1.0f + 0.06f * sinf(elapsed / 220.0f);
+      int h = max(2, (int)lroundf((EYE_H + 4) * pulse * open));
+      drawEyeShape(EYE_CX_L + gx, EYE_CY - 3 + gy, EYE_W + 2, h);
+      drawEyeShape(EYE_CX_R + gx, EYE_CY - 3 + gy, EYE_W + 2, h);
+      const int BARS = 7, barW = 4, barGap = 3;
+      int x0 = (SCREEN_WIDTH - (BARS * barW + (BARS - 1) * barGap)) / 2;
+      for (int i = 0; i < BARS; i++) {
+        float lvl;
+        if (micLevel >= 0) lvl = micLevel * (0.6f + 0.4f * fabsf(sinf(elapsed / 90.0f + i * 1.7f)));
+        else               lvl = fabsf(sinf(elapsed / 140.0f + i * 1.9f) * sinf(elapsed / 310.0f + i));
+        int bh = 3 + (int)lroundf(9.0f * constrain(lvl, 0.0f, 1.0f));
+        display.fillRect(x0 + i * (barW + barGap), 62 - bh, barW, bh, SSD1306_WHITE);
+      }
+      break;
+    }
+
+    case FACE_LOADING_BAR: {
+      float ph = sinf(elapsed / 450.0f);
+      int gx = (int)lroundf(8.0f * ph);
+      int h = max(2, (int)lroundf(24.0f * open));
+      drawEyeShape(EYE_CX_L + gx, 20, EYE_W, h);
+      drawEyeShape(EYE_CX_R + gx, 20, EYE_W, h);
+      drawScannerBar(0.5f + 0.5f * ph);
+      break;
+    }
+
+    case FACE_LOADING_REACTOR: {
+      updateGaze(now, 0, 0, 3, 1);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      int h = max(2, (int)lroundf(16.0f * open));
+      drawEyeShape(EYE_CX_L + gx, 12 + gy, 26, h);
+      drawEyeShape(EYE_CX_R + gx, 12 + gy, 26, h);
+      drawReactor(64, 42, elapsed);
+      break;
+    }
+
+    case FACE_SPEAKING: {
+      updateGaze(now, 0, 0, 3, 1);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      int h = max(2, (int)lroundf(EYE_H * 0.85f * open));
+      drawEyeShape(EYE_CX_L + gx, EYE_CY - 2 + gy, EYE_W, h);
+      drawEyeShape(EYE_CX_R + gx, EYE_CY - 2 + gy, EYE_W, h);
+      float talk;
+      if (speakLevel >= 0) talk = constrain(speakLevel, 0.0f, 1.0f) * (0.6f + 0.4f * fabsf(sinf(elapsed / 70.0f)));
+      else                 talk = fabsf(sinf(elapsed / 85.0f) * sinf(elapsed / 230.0f + 1.0f));
+      int mh = 3 + (int)lroundf(11.0f * talk);
+      int mw = 18 + (int)lroundf(6.0f * talk);
+      display.fillRoundRect(64 - mw / 2 + gx / 2, 48, mw, mh, min(5, mh / 2), SSD1306_WHITE);
+      break;
+    }
+
+    // Spiral eyes that rotate, a wobbling head and a wavy mouth.
+    case FACE_DIZZY: {
+      int wob = (int)lroundf(3.0f * sinf(elapsed / 150.0f));
+      float phase = elapsed / 120.0f;
+      drawSpiral(EYE_CX_L + wob, 24, 13, phase, 1);
+      drawSpiral(EYE_CX_R + wob, 24, 13, phase, 1);
+      int px = 50 + wob, py = 54;
+      for (int x = 0; x < 28; x++) {
+        int y = 54 + (int)lroundf(2.0f * sinf(x / 2.5f + elapsed / 100.0f));
+        if (x > 0) display.drawLine(px, py, 50 + wob + x, y, SSD1306_WHITE);
+        px = 50 + wob + x;
+        py = y;
+      }
+      break;
+    }
+
+    // Closed eyes and floating z. In the demo it wakes up after 3.5 s. In the robot, call wakeUp().
+    case FACE_SLEEPING: {
+      float wake = 0.0f;
+      if (AUTO_CYCLE) {
+        if (elapsed > 3500) wake = min(1.0f, (elapsed - 3500) / 1200.0f);
+      } else if (waking) {
+        wake = min(1.0f, (now - wakeStartAt) / 1200.0f);
+        if (wake >= 1.0f) {
+          waking = false;
+          setFace(FACE_IDLE, now);
+        }
+      }
+      int breathe = (int)lroundf(1.0f * sinf(elapsed / 600.0f));
+      if (wake < 0.12f) {
+        drawCurve(EYE_CX_L, 30 + breathe, 12, 3, 1);
+        drawCurve(EYE_CX_R, 30 + breathe, 12, 3, 1);
+        display.drawFastHLine(60, 52, 8, SSD1306_WHITE);
+        for (int k = 0; k < 3; k++) {
+          int ph = (int)((elapsed / 50 + k * 14) % 42);
+          display.setTextSize(1 + ph / 15);
+          display.setCursor(100 + ph / 4, 46 - ph);
+          display.print("z");
+        }
+      } else {
+        int h = max(2, (int)lroundf(EYE_H * wake * open));
+        drawEyeShape(EYE_CX_L, EYE_CY, EYE_W, h);
+        drawEyeShape(EYE_CX_R, EYE_CY, EYE_W, h);
+        display.drawFastHLine(58, 54, 12, SSD1306_WHITE);
+      }
+      break;
+    }
+
+    // "?" above one eye, one eye smaller, a squiggly mouth.
+    case FACE_CONFUSED: {
+      updateGaze(now, 0, 0, 3, 1);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      int hL = max(2, (int)lroundf(EYE_H * open));
+      int hR = max(2, (int)lroundf(EYE_H * 0.65f * open));
+      drawEyeShape(EYE_CX_L - 4 + gx, EYE_CY + gy, EYE_W, hL);
+      drawEyeShape(EYE_CX_R - 8 + gx, EYE_CY + 3 + gy, EYE_W, hR);
+      int bob = (int)lroundf(2.0f * sinf(elapsed / 200.0f));
+      display.setTextSize(3);
+      display.setCursor(108, 4 + bob);
+      display.print("?");
+      int px = 48, py = 54;
+      for (int x = 0; x <= 32; x++) {
+        int y = 54 + (int)lroundf(2.5f * sinf(x / 3.0f));
+        display.drawLine(px, py, 48 + x, y, SSD1306_WHITE);
+        px = 48 + x;
+        py = y;
+      }
+      break;
+    }
+
+    // Eyes pop wide with small black pupils, an "o" mouth.
+    case FACE_SURPRISED: {
+      updateGaze(now, 0, 0, 2, 1);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      float pop = (elapsed < 300) ? 0.7f + 0.4f * (elapsed / 300.0f) : 1.0f + 0.02f * sinf(elapsed / 90.0f);
+      int w = (int)lroundf(30 * pop), h = max(2, (int)lroundf(36 * pop * open));
+      drawEyeShape(EYE_CX_L + gx, 22 + gy, w, h);
+      drawEyeShape(EYE_CX_R + gx, 22 + gy, w, h);
+      if (open > 0.5f) {
+        int pr = (elapsed < 300) ? 5 : 4;
+        display.fillCircle(EYE_CX_L + gx + (int)(gazeX / 2), 22 + gy, pr, SSD1306_BLACK);
+        display.fillCircle(EYE_CX_R + gx + (int)(gazeX / 2), 22 + gy, pr, SSD1306_BLACK);
+      }
+      display.drawCircle(64, 55, 5, SSD1306_WHITE);
+      display.drawCircle(64, 55, 4, SSD1306_WHITE);
+      break;
+    }
+
+    // Eyes look to the turning side and arrows run that way, like a turn signal.
+    case FACE_TURN_LEFT:
+    case FACE_TURN_RIGHT: {
+      int dir = (face == FACE_TURN_RIGHT) ? 1 : -1;
+      int gx = dir * (8 + (int)lroundf(1.5f * sinf(elapsed / 120.0f)));
+      int h = max(2, (int)lroundf(EYE_H * open));
+      drawEyeShape(EYE_CX_L + gx, EYE_CY - 2, EYE_W, h);
+      drawEyeShape(EYE_CX_R + gx, EYE_CY - 2, EYE_W, h);
+      int n = (int)((elapsed / 180) % 4);
+      for (int i = 0; i < n; i++) {
+        int x = (dir > 0) ? (52 + i * 12) : (76 - i * 12);
+        drawChevron(x, 54, dir);
+      }
+      break;
+    }
+
+    // X eyes and the label "I am stuck".
+    case FACE_STUCK: {
+      int sh = ((elapsed % 1500) < 400) ? (((elapsed / 60) % 2) ? 1 : -1) : 0;
+      for (int e = 0; e < 2; e++) {
+        int cx = (e == 0 ? EYE_CX_L : EYE_CX_R) + sh, cy = 20;
+        drawThickLine(cx - 10, cy - 10, cx + 10, cy + 10, 1, SSD1306_WHITE);
+        drawThickLine(cx - 10, cy + 10, cx + 10, cy - 10, 1, SSD1306_WHITE);
+      }
+      display.fillRoundRect(28, 44, 72, 14, 3, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      drawTextCentered("I am stuck", 48, 1);
+      display.setTextColor(SSD1306_WHITE);
+      break;
+    }
+
+    // Crossed WiFi icon. The robot keeps working with its stored phrases.
+    case FACE_NO_WIFI: {
+      int cx = 64, cy = 42;
+      for (int i = 1; i <= 3; i++) drawArc(cx, cy, i * 8, 45, 135);
+      display.fillCircle(cx, cy, 2, SSD1306_WHITE);
+      drawThickLine(42, 12, 86, 48, 3, SSD1306_BLACK);
+      drawThickLine(42, 12, 86, 48, 1, SSD1306_WHITE);
+      drawTextCentered("offline mode", 54, 1);
+      break;
+    }
+
+    // Tired eyes and a blinking battery icon.
+    case FACE_LOW_BATTERY: {
+      updateGaze(now, 0, 3, 2, 1);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      int h = max(2, (int)lroundf(14.0f * open));
+      drawEyeShape(EYE_CX_L + gx, EYE_CY + 4 + gy, EYE_W, h);
+      drawEyeShape(EYE_CX_R + gx, EYE_CY + 4 + gy, EYE_W, h);
+      display.drawFastHLine(56, 54, 16, SSD1306_WHITE);
+      drawBatteryIcon(104, 3, batteryPct, ((elapsed / 400) % 2) == 0);
+      break;
+    }
+
+    // The three readings of the sensor servo, with a sweeping line.
+    // Angles are the SERVO angles. If the radar looks mirrored, swap the 30 and 150 readings.
+    case FACE_RADAR: {
+      const int cx = 64, cy = 62;
+      drawArc(cx, cy, 20, 0, 180);
+      drawArc(cx, cy, 40, 0, 180);
+      drawArc(cx, cy, 58, 0, 180);
+      display.drawFastHLine(4, cy, 121, SSD1306_WHITE);
+      float sweepDeg = 30.0f + 120.0f * (0.5f + 0.5f * sinf(elapsed / 700.0f));
+      float rad = sweepDeg * PI / 180.0f;
+      display.drawLine(cx, cy, cx + (int)lroundf(58 * cosf(rad)), cy - (int)lroundf(58 * sinf(rad)), SSD1306_WHITE);
+      const int ang[3] = { 30, 90, 150 };
+      for (int i = 0; i < 3; i++) {
+        int cm = radarCm[i];
+        float rr = (cm <= 0) ? 58.0f : (6.0f + 52.0f * min(cm, 150) / 150.0f);
+        float a = ang[i] * PI / 180.0f;
+        int bx = cx + (int)lroundf(rr * cosf(a)), by = cy - (int)lroundf(rr * sinf(a));
+        if (fabsf(sweepDeg - ang[i]) < 14.0f) display.fillCircle(bx, by, 3, SSD1306_WHITE);
+        else                                   display.drawCircle(bx, by, 2, SSD1306_WHITE);
+      }
+      break;
+    }
+
+    // What the robot heard, and what it will say (typing effect).
+    case FACE_TRANSCRIPT: {
+      display.setTextSize(1);
+      display.setTextWrap(true);
+      display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(2, 1);
+      display.print("You said:");
+      display.fillRect(0, 34, 128, 10, SSD1306_WHITE);
+      display.setCursor(2, 35);
+      display.print("I will say:");
+      display.setTextColor(SSD1306_WHITE);
+      char tmp[48];
+      int n1 = min((int)(elapsed / 70), (int)strlen(transcriptYou));
+      strncpy(tmp, transcriptYou, n1);
+      tmp[n1] = 0;
+      display.setCursor(2, 13);
+      display.print(tmp);
+      long t2 = (long)elapsed - 1500;
+      int n2 = (t2 <= 0) ? 0 : min((int)(t2 / 70), (int)strlen(transcriptMe));
+      strncpy(tmp, transcriptMe, n2);
+      tmp[n2] = 0;
+      display.setCursor(2, 47);
+      display.print(tmp);
+      break;
+    }
+
+    // Beating heart eyes, a smile and small hearts floating up.
+    case FACE_HEART: {
+      int r = 6 + (int)lroundf(2.0f * fabsf(sinf(elapsed / 190.0f)));
+      drawHeart(EYE_CX_L, 22, r);
+      drawHeart(EYE_CX_R, 22, r);
+      drawCurve(64, 48, 14, 6, 1);
+      for (int k = 0; k < 2; k++) {
+        int ph = (int)((elapsed / 35 + k * 24) % 50);
+        drawHeart(64 + (k ? 14 : -14) + (int)lroundf(3.0f * sinf(ph / 5.0f)), 62 - ph, 2);
+      }
+      break;
+    }
+
+    // Left eye open, right eye winks (an arch), a smile and a sparkle.
+    case FACE_WINK: {
+      updateGaze(now, 0, 0, 2, 1);
+      int gx = (int)lroundf(gazeX), gy = (int)lroundf(gazeY);
+      bool winkNow = ((elapsed % 2200) >= 500) && ((elapsed % 2200) < 1500);
+      int hL = max(2, (int)lroundf(EYE_H * open));
+      drawEyeShape(EYE_CX_L + gx, EYE_CY + gy, EYE_W, hL);
+      if (winkNow) {
+        drawCurve(EYE_CX_R + gx, EYE_CY + 8 + gy, 13, -9, 2);
+        drawSparkle(112, 10, 5 + (int)(elapsed / 120) % 2);
+      } else {
+        drawEyeShape(EYE_CX_R + gx, EYE_CY + gy, EYE_W, hL);
+      }
+      drawCurve(64 + gx / 2, 49, 16, 7, 1);
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// ===================== smooth transition (dissolve) =====================
+void composeDissolve(const uint8_t* a, const uint8_t* b, float progress) {
+  static const uint8_t bayer[4][4] = { { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 } };
+  uint8_t* out = display.getBuffer();
+  int thr = (int)(progress * 16.0f);
+  for (int page = 0; page < SCREEN_HEIGHT / 8; page++) {
+    for (int x = 0; x < SCREEN_WIDTH; x++) {
+      int idx = page * SCREEN_WIDTH + x;
+      uint8_t o = 0;
+      for (int bit = 0; bit < 8; bit++) {
+        int y = page * 8 + bit;
+        uint8_t src = (bayer[y & 3][x & 3] < thr) ? b[idx] : a[idx];
+        o |= (src & (1 << bit));
+      }
+      out[idx] = o;
+    }
+  }
+}
+
+void drawFrame(unsigned long now) {
+  unsigned long elapsed = now - faceStart;
+  bool dissolving = (prevFace != FACE_COUNT) && (now - transStart < DISSOLVE_MS);
+  if (!dissolving) {
+    renderFace(currentFace, now, elapsed);
+    return;
+  }
+  renderFace(prevFace, now, now - prevStart);
+  memcpy(bufOld, display.getBuffer(), sizeof(bufOld));
+  renderFace(currentFace, now, elapsed);
+  memcpy(bufNew, display.getBuffer(), sizeof(bufNew));
+  composeDissolve(bufOld, bufNew, (float)(now - transStart) / DISSOLVE_MS);
+}
+
+// ===================== boot splash =====================
+void showSplash() {
+  int len = (int)strlen(ROBOT_NAME);
+  int textW = len * 18 - 3;
+  int x = max(0, (SCREEN_WIDTH - textW) / 2);
+  unsigned long t0 = millis();
+  while (millis() - t0 < SPLASH_MS) {
+    unsigned long e = millis() - t0;
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(3);
+    display.setCursor(x, 8);
+    display.print(ROBOT_NAME);
+    display.setTextSize(1);
+    display.setCursor(34, 36);
+    display.print("booting...");
+    display.drawRect(24, 50, 80, 8, SSD1306_WHITE);
+    display.fillRect(26, 52, (int)(76UL * e / SPLASH_MS), 4, SSD1306_WHITE);
+    display.display();
+    delay(30);
+  }
+}
+
+// ===================== face switching =====================
+void setFace(Face f, unsigned long now) {
+  if (started && f != currentFace && DISSOLVE_MS > 0) {
+    prevFace = currentFace;
+    prevStart = faceStart;
+    transStart = now;
+  }
+  started = true;
+  currentFace = f;
+  faceStart = now;
+  nextGazeAt = 0;
+  waking = false;
+  idleAction = 0;
+  nextIdleAt = now + (AUTO_CYCLE ? 1200 : random(10000, 20000));
+  Serial.print("Face: ");
+  Serial.println(FACE_NAMES[f]);
+}
+
+// Call from the robot logic when the robot should wake up (PIR motion, or it hears its name).
+void wakeUp(unsigned long now) {
+  if (currentFace == FACE_SLEEPING && !waking) {
+    waking = true;
+    wakeStartAt = now;
+  }
+}
+
+void handleSerial(unsigned long now) {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'n') setFace((Face)((currentFace + 1) % FACE_COUNT), now);
+    else if (c == 'p') setFace((Face)((currentFace + FACE_COUNT - 1) % FACE_COUNT), now);
+  }
+}
+
+// ===================== Arduino entry points =====================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(PIN_SDA, PIN_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("SSD1306 not found: check SDA/SCL wiring and the address 0x3C"));
+    for (;;) delay(1000);
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  if (SHOW_SPLASH) showSplash();
+  setFace(FACE_IDLE, millis());
+}
+
+void loop() {
+  unsigned long now = millis();
+  handleSerial(now);
+  if (now - lastFrame < FRAME_MS) {
+    delay(2);
+    return;
+  }
+  lastFrame = now;
+
+  if (AUTO_CYCLE && now - faceStart >= FACE_MS) {
+    setFace((Face)((currentFace + 1) % FACE_COUNT), now);
+  }
+
+  drawFrame(now);
+  display.display();
+}
